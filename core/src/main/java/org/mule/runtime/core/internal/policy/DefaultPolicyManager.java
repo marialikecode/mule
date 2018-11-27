@@ -41,6 +41,9 @@ import java.util.Optional;
 
 import javax.inject.Inject;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+
 /**
  * Default implementation of {@link PolicyManager}.
  *
@@ -62,6 +65,8 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
 
   private PolicyPointcutParametersManager policyPointcutParametersManager;
 
+  private Cache<PolicyPointcutParameters, SourcePolicy> sourcePoliciesCache = Caffeine.newBuilder().build();
+
   @Override
   public SourcePolicy createSourcePolicyInstance(Component source, CoreEvent sourceEvent,
                                                  Processor flowExecutionProcessor,
@@ -70,10 +75,15 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
     PolicyPointcutParameters sourcePointcutParameters =
         policyPointcutParametersManager.createSourcePointcutParameters(source, sourceEvent);
 
+    final SourcePolicy cachedPolicy = sourcePoliciesCache.getIfPresent(sourcePointcutParameters);
+    if (cachedPolicy != null) {
+      return cachedPolicy;
+    }
+
     List<Policy> parameterizedPolicies = policyProvider.findSourceParameterizedPolicies(sourcePointcutParameters);
     if (parameterizedPolicies.isEmpty()) {
-      return event -> from(process(sourceEvent, flowExecutionProcessor))
-          .switchIfEmpty(fromSupplier(() -> CoreEvent.builder(sourceEvent).message(of(null)).build()))
+      return sourcePoliciesCache.get(sourcePointcutParameters, p -> event -> from(process(event, flowExecutionProcessor))
+          .switchIfEmpty(fromSupplier(() -> CoreEvent.builder(event).message(of(null)).build()))
           .<Either<SourcePolicyFailureResult, SourcePolicySuccessResult>>map(flowExecutionResult -> right(new SourcePolicySuccessResult(flowExecutionResult,
                                                                                                                                         () -> messageSourceResponseParametersProcessor
                                                                                                                                             .getSuccessfulExecutionResponseParametersFunction()
@@ -81,18 +91,22 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
                                                                                                                                         messageSourceResponseParametersProcessor)))
           .onErrorResume(Exception.class, e -> {
             MessagingException messagingException = e instanceof MessagingException ? (MessagingException) e
-                : new MessagingException(sourceEvent, e, (Component) flowExecutionProcessor);
+                : new MessagingException(event, e, (Component) flowExecutionProcessor);
             return just(Either
                 .left(new SourcePolicyFailureResult(messagingException, () -> messageSourceResponseParametersProcessor
                     .getFailedExecutionResponseParametersFunction()
                     .apply(messagingException.getEvent()))));
-          });
+          }));
+    } else {
+      return sourcePoliciesCache.get(sourcePointcutParameters, p -> new CompositeSourcePolicy(parameterizedPolicies,
+                                                                                              lookupSourceParametersTransformer(source
+                                                                                                  .getLocation()
+                                                                                                  .getComponentIdentifier()
+                                                                                                  .getIdentifier()),
+                                                                                              sourcePolicyProcessorFactory,
+                                                                                              flowExecutionProcessor,
+                                                                                              messageSourceResponseParametersProcessor));
     }
-    return new CompositeSourcePolicy(parameterizedPolicies,
-                                     lookupSourceParametersTransformer(source.getLocation().getComponentIdentifier()
-                                         .getIdentifier()),
-                                     sourcePolicyProcessorFactory, flowExecutionProcessor,
-                                     messageSourceResponseParametersProcessor);
   }
 
   @Override
@@ -131,6 +145,9 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
     sourcePolicyProcessorFactory = new DefaultSourcePolicyProcessorFactory(policyStateHandler);
     MuleRegistry registry = ((MuleContextWithRegistry) muleContext).getRegistry();
     policyProvider = registry.lookupLocalObjects(PolicyProvider.class).stream().findFirst().orElse(new NullPolicyProvider());
+
+    policyProvider.onPoliciesDeploymentChange(() -> sourcePoliciesCache.invalidateAll());
+
     sourcePolicyParametersTransformerCollection = registry.lookupObjects(SourcePolicyParametersTransformer.class);
     operationPolicyParametersTransformerCollection = registry.lookupObjects(OperationPolicyParametersTransformer.class);
     policyPointcutParametersManager =
@@ -142,7 +159,6 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
   public void disposePoliciesResources(String executionIdentifier) {
     policyStateHandler.destroyState(executionIdentifier);
   }
-
 
   public void setMuleContext(MuleContext muleContext) {
     this.muleContext = muleContext;
